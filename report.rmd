@@ -1,0 +1,243 @@
+---
+title: "Prediction Assignment Writeup"
+author: "Manju Gowda"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Libraries & reproducible seed
+library(caret); library(dplyr); library(ggplot2); library(randomForest)
+library(doParallel)
+set.seed(1234)
+
+# FAST MODE: keep TRUE while developing and knitting in the sandbox.
+# If you want to re-train fully (longer), set to FALSE.
+fast_mode <- TRUE
+
+# Parameters (fast_mode controls these)
+if(fast_mode) {
+  cv_number <- 3
+  cv_repeats <- 1
+  rf_ntree <- 100
+  tune_len <- 3
+} else {
+  cv_number <- 10
+  cv_repeats <- 3
+  rf_ntree <- 500
+  tune_len <- 5
+}
+```
+
+# 1. Introduction
+
+This report builds a classifier to predict the exercise class (`classe`) using accelerometer data. It describes data cleaning, feature reduction, model training, validation, and generates predictions for 20 test cases.
+
+# 2. Data load & initial cleaning
+
+```{r data-load}
+# Download datasets if not already present
+if(!file.exists("pml-training.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                destfile = "pml-training.csv", mode = "wb")
+}
+if(!file.exists("pml-testing.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                destfile = "pml-testing.csv", mode = "wb")
+}
+
+train_raw <- read.csv("pml-training.csv", na.strings = c("NA","#DIV/0!",""))
+test_raw  <- read.csv("pml-testing.csv",  na.strings = c("NA","#DIV/0!",""))
+
+cat("Raw train dim:", dim(train_raw), "\n")
+cat("Raw test dim:", dim(test_raw), "\n")
+
+# Remove columns with >=95% NA
+na_frac <- sapply(train_raw, function(x) mean(is.na(x)))
+keep_cols <- names(na_frac)[na_frac < 0.95]
+train <- train_raw[, keep_cols, drop=FALSE]
+
+# Remove known metadata columns
+meta_cols <- c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2",
+               "cvtd_timestamp","new_window","num_window")
+train <- train %>% select(-one_of(intersect(meta_cols, names(train))))
+
+# Keep only columns present in train for test (test has no 'classe')
+test <- test_raw[, intersect(names(test_raw), names(train)[names(train) != "classe"]), drop = FALSE]
+
+cat("After cleaning: train dim:", dim(train), " test dim:", dim(test), "\n")
+```
+
+# 3. Robust feature reduction
+
+This step removes non-numeric/all-NA columns, near-zero variance, and highly correlated predictors — with guards to avoid dropping everything.
+
+```{r feature-reduction}
+# 1) Numeric predictors
+numeric_idx <- sapply(train, is.numeric)
+train_numeric <- train[, numeric_idx, drop=FALSE]
+cat("Numeric variables (initial):", ncol(train_numeric), "\n")
+
+# Drop columns that are all NA (if any)
+train_numeric <- train_numeric[, colSums(!is.na(train_numeric)) > 0, drop=FALSE]
+cat("Numeric vars after dropping all-NA columns:", ncol(train_numeric), "\n")
+
+# 2) NZV removal (guarded)
+nzv <- nearZeroVar(train_numeric)
+cat("NZV count:", length(nzv), "\n")
+if(length(nzv) > 0 && length(nzv) < ncol(train_numeric)) {
+  train_numeric2 <- train_numeric[, -nzv, drop=FALSE]
+} else {
+  train_numeric2 <- train_numeric
+}
+cat("After NZV removal:", ncol(train_numeric2), "\n")
+
+# 3) Correlation removal (only if >= 2 vars)
+if(ncol(train_numeric2) > 1) {
+  descrCor <- cor(train_numeric2, use = "pairwise.complete.obs")
+  if(all(is.na(descrCor))) {
+    warning("Correlation matrix is all NA — skipping correlation filtering.")
+    train_reduced <- train_numeric2
+  } else {
+    highCorr <- findCorrelation(descrCor, cutoff = 0.98)
+    cat("Highly correlated to remove:", length(highCorr), "\n")
+    if(length(highCorr) > 0 && length(highCorr) < ncol(train_numeric2)) {
+      train_reduced <- train_numeric2[, -highCorr, drop=FALSE]
+    } else {
+      train_reduced <- train_numeric2
+    }
+  }
+} else {
+  train_reduced <- train_numeric2
+}
+cat("Final predictors after reduction:", ncol(train_reduced), "\n")
+
+# 4) Final processed training data (attach classe)
+if(ncol(train_reduced) < 1) stop("No predictors left after reduction. Adjust cutoffs.")
+train_processed <- cbind(train_reduced, classe = train$classe)
+```
+
+# 4. Train / validation split
+
+```{r split}
+set.seed(1234)
+inTrain <- createDataPartition(y = train_processed$classe, p = 0.75, list = FALSE)
+training <- train_processed[inTrain, , drop=FALSE]
+validation <- train_processed[-inTrain, , drop=FALSE]
+cat("Training rows:", nrow(training), "Validation rows:", nrow(validation), "\n")
+```
+
+# 5. Model training (or load saved model)
+
+We attempt to **load** a saved `final_model.rds` if present to avoid re-training during knit. If not found, behavior depends on `fast_mode`:  
+- `fast_mode = TRUE` → trains a smaller model (faster)  
+- `fast_mode = FALSE` → trains with fuller settings (longer)
+
+```{r train-or-load}
+# Helper: ensure test predictors match training predictors
+ensure_test_matrix <- function(test_df, predictor_names) {
+  test_df2 <- test_df[, intersect(names(test_df), predictor_names), drop = FALSE]
+  missing <- setdiff(predictor_names, names(test_df2))
+  if(length(missing) > 0) for(nm in missing) test_df2[[nm]] <- NA
+  test_df2 <- test_df2[, predictor_names, drop = FALSE]
+  return(test_df2)
+}
+
+predictor_names <- names(train_reduced)
+
+# If we have a saved model, load it (fast)
+if(file.exists("final_model.rds") && file.exists("conf_val.rds") && file.exists("pred_test.rds")) {
+  message("Loading saved model and results from disk (final_model.rds, conf_val.rds, pred_test.rds).")
+  final_model <- readRDS("final_model.rds")
+  conf_val <- readRDS("conf_val.rds")
+  pred_test <- readRDS("pred_test.rds")
+} else {
+  # Train now (may take time). Use parallel backend safely.
+  num_cores <- parallel::detectCores(logical = FALSE)
+  use_cores <- min(4, max(1, num_cores))
+  cl <- makePSOCKcluster(use_cores)
+  registerDoParallel(cl)
+
+  tc <- trainControl(method = "repeatedcv", number = cv_number, repeats = cv_repeats)
+
+  if(fast_mode) {
+    message("fast_mode = TRUE -> training a smaller/faster RF for reproducibility in sandbox.")
+  } else {
+    message("fast_mode = FALSE -> training full RF (may take longer).")
+  }
+
+  # Train model
+  set.seed(1234)
+  system.time({
+    final_model <- train(classe ~ ., data = training,
+                         method = "rf",
+                         trControl = tc,
+                         ntree = rf_ntree,
+                         tuneLength = tune_len)
+  })
+
+  stopCluster(cl)
+  registerDoSEQ()
+
+  # Evaluate on validation (make sure factor levels match)
+  canonical_levels <- levels(factor(train_processed$classe))
+  pred_val <- predict(final_model, newdata = validation)
+  pred_val <- factor(as.character(pred_val), levels = canonical_levels)
+  reference_val <- factor(as.character(validation$classe), levels = canonical_levels)
+  conf_val <- confusionMatrix(data = pred_val, reference = reference_val)
+
+  # Prepare test predictors and predict
+  test_pred <- ensure_test_matrix(test, predictor_names)
+  pred_test <- predict(final_model, newdata = test_pred)
+
+  # Save objects for faster knitting later
+  saveRDS(final_model, file = "final_model.rds")
+  saveRDS(conf_val, file = "conf_val.rds")
+  saveRDS(pred_test, file = "pred_test.rds")
+  writeLines(as.character(pred_test), con = "predictions.txt")
+  message("Saved final_model.rds, conf_val.rds, pred_test.rds, predictions.txt")
+}
+```
+
+# 6. Validation results (use loaded or newly computed `conf_val`)
+
+```{r evaluation}
+# Display confusion matrix & accuracy
+print(conf_val)
+cat("Validation accuracy:", round(conf_val$overall["Accuracy"], 4), "\n")
+cat("Estimated OOS error:", round(1 - conf_val$overall["Accuracy"], 4), "\n")
+```
+
+# 7. Variable importance
+
+```{r varimp, fig.height=5}
+# Only plot if model and varImp are available
+if(exists("final_model")) {
+  vi <- varImp(final_model, scale = TRUE)
+  plot(vi, top = 20, main = "Top 20 Variable Importance")
+}
+```
+
+# 8. Test predictions (20 cases)
+
+```{r test-preds}
+# Print first 20 predictions (should be 20)
+if(!exists("pred_test")) {
+  # load if available
+  if(file.exists("pred_test.rds")) pred_test <- readRDS("pred_test.rds")
+}
+cat("Number of test predictions:", length(pred_test), "\n")
+print(pred_test)
+# File predictions.txt should already exist after training; if not, write it
+if(!file.exists("predictions.txt")) writeLines(as.character(pred_test), "predictions.txt")
+```
+
+# 9. Conclusion
+
+The Random Forest model above was trained and evaluated; the validation accuracy and confusion matrix are reported. Final predictions for the 20 test cases are saved in `predictions.txt`.
+
+# 10. Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
